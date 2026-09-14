@@ -1,11 +1,13 @@
-# Secure Laravel VPS Bootstrap
+# Secure Laravel VPS Setup
 
-A security-first Bash bootstrap for preparing a fresh Ubuntu VPS for a Laravel application with Nginx, PHP-FPM, Composer, UFW, Fail2ban, Supervisor, and optional HTTPS via Certbot.
+A security-first, idempotent Bash toolkit that provisions a fresh Ubuntu VPS for one or more Laravel sites: Nginx, PHP-FPM (8.3/8.4), Composer, Node.js/npm, UFW, Fail2ban, Supervisor queue workers, and Certbot SSL with DNS-propagation checks and multi-domain/subdomain support.
 
-Recommended repository name:
+Repository name: `secure-laravel-vps-setup`
+
+GitHub description (for the repo's "About" field):
 
 ```text
-secure-laravel-vps-bootstrap
+Idempotent Bash toolkit to provision a Laravel-ready Ubuntu VPS: Nginx, PHP 8.3/8.4, Node.js, UFW, Fail2ban, Certbot SSL, multi-domain/subdomain support.
 ```
 
 ## What this repository does
@@ -27,7 +29,7 @@ The installer is intentionally conservative:
 ## Folder structure
 
 ```text
-secure-laravel-vps-bootstrap/
+secure-laravel-vps-setup/
 ├── README.md
 ├── SECURITY.md
 ├── .gitignore
@@ -81,16 +83,16 @@ Before running `install.sh` (and definitely before `--enable-ssl`):
 Replace the GitHub URL with your own repository URL after you push this project.
 
 ```bash
-git clone https://github.com/Tahsin000/secure-laravel-vps-bootstrap.git
-cd secure-laravel-vps-bootstrap
+git clone https://github.com/Tahsin000/secure-laravel-vps-setup.git
+cd secure-laravel-vps-setup
 sudo bash scripts/install.sh --domain example.com --app-dir /var/www/example.com
 ```
 
 With HTTPS enabled:
 
 ```bash
-git clone https://github.com/Tahsin000/secure-laravel-vps-bootstrap.git
-cd secure-laravel-vps-bootstrap
+git clone https://github.com/Tahsin000/secure-laravel-vps-setup.git
+cd secure-laravel-vps-setup
 sudo bash scripts/install.sh \
   --domain example.com \
   --app-dir /var/www/example.com \
@@ -144,7 +146,7 @@ This section is the exact command flow to run after you clone or pull this repos
 ### 1. One-time VPS bootstrap (run once per server)
 
 ```bash
-cd ~/secure-laravel-vps-bootstrap
+cd ~/secure-laravel-vps-setup
 git pull --ff-only
 
 sudo bash scripts/install.sh \
@@ -197,7 +199,7 @@ php artisan config:cache
 php artisan route:cache
 php artisan view:cache
 
-cd ~/secure-laravel-vps-bootstrap
+cd ~/secure-laravel-vps-setup
 sudo bash scripts/fix-permissions.sh --app-dir "${APP_DIR}"
 sudo systemctl reload nginx
 sudo systemctl restart "${PHP_FPM_SERVICE}"
@@ -215,7 +217,7 @@ composer install --no-dev --optimize-autoloader
 npm ci && npm run build   # skip if your project is API-only
 php artisan migrate --force
 php artisan optimize
-cd ~/secure-laravel-vps-bootstrap
+cd ~/secure-laravel-vps-setup
 sudo bash scripts/fix-permissions.sh --app-dir "${APP_DIR}"
 sudo systemctl reload nginx
 sudo systemctl restart "${PHP_FPM_SERVICE}"
@@ -226,7 +228,7 @@ sudo systemctl restart "${PHP_FPM_SERVICE}"
 Re-run `install.sh` with the same options. It is designed to be safely re-applied for package/config alignment.
 
 ```bash
-cd ~/secure-laravel-vps-bootstrap
+cd ~/secure-laravel-vps-setup
 git pull --ff-only
 sudo bash scripts/install.sh --domain example.com --app-dir /var/www/example.com --ssh-port 22
 ```
@@ -444,7 +446,7 @@ To add a `dev` subdomain on the *same droplet*, in this order:
 1. **DNS first.** Add an `A` record for `dev.example.com` → this droplet's public IP. Wait for it, confirm with `dig +short dev.example.com`.
 2. **Re-run the installer**, new `--domain`/`--app-dir`, same `--ssh-port` as before, and skip flags for things already installed (`--install-mysql`, `--allow-php-ppa`, etc. — safe to omit once satisfied):
    ```bash
-   cd ~/secure-laravel-vps-bootstrap && git pull --ff-only
+   cd ~/secure-laravel-vps-setup && git pull --ff-only
    sudo bash scripts/install.sh \
      --domain dev.example.com --app-dir /var/www/dev.example.com \
      --ssh-port 22 --enable-ssl --email admin@example.com
@@ -513,7 +515,7 @@ apt-cache policy php8.4-fpm
 If it shows `(none)` as the candidate, your repos don't have PHP 8.4. Re-run the installer with `--allow-php-ppa` to add the well-known, widely trusted [`ondrej/php`](https://launchpad.net/~ondrej/+archive/ubuntu/php) PPA and install PHP 8.4 from it:
 
 ```bash
-cd ~/secure-laravel-vps-bootstrap
+cd ~/secure-laravel-vps-setup
 git pull --ff-only
 sudo bash scripts/install.sh \
   --domain example.com \
