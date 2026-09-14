@@ -16,6 +16,13 @@ INSTALL_MYSQL="false"
 INSTALL_REDIS="false"
 SITE_ID=""
 AUTO_FELL_BACK_TO_83="false"
+INCLUDE_WWW="false"
+ALLOW_PHP_PPA="false"
+SKIP_DNS_CHECK="false"
+SERVER_NAMES=""
+DNS_CHECK_PASSED="unknown"
+INSTALL_NODE="true"
+NODE_MAJOR="22"
 
 log() {
   printf '\n\033[1;32m[+] %s\033[0m\n' "$*"
@@ -43,16 +50,33 @@ Required:
 Options:
   --app-dir PATH              Laravel application directory. Default: /var/www/laravel
   --php-version VERSION       PHP version to install. Default: auto, tries 8.4 then 8.3
+  --allow-php-ppa             If PHP 8.4 is not in your default APT repos, add the trusted
+                               ondrej/php PPA to get it. Off by default (keeps the installer
+                               third-party-repo-free unless you opt in).
   --ssh-port PORT             SSH port to keep open in UFW. Default: 22
   --enable-ssl                Install Certbot and request HTTPS certificate with Nginx
   --email EMAIL               Email for Let's Encrypt registration. Required with --enable-ssl
+  --include-www               Also configure and (with --enable-ssl) certify www.DOMAIN.
+                               Only use this if www.DOMAIN already has its own DNS A record.
   --install-mysql             Install MySQL server locally. MySQL port is NOT opened in UFW
   --install-redis             Install Redis locally and bind it to localhost only
+  --node-version MAJOR        Node.js major version to install via NodeSource. Default: 22
+  --skip-node                 Do not install Node.js/npm. On by default it IS installed, since
+                               React/Vue/Vite front-end scaffolding needs it to build assets.
+  --skip-dns-check            Skip the pre-flight check that DOMAIN resolves to this server.
+                               Not recommended: with --enable-ssl, Certbot will fail anyway if
+                               DNS is not propagated yet.
   -h, --help                  Show this help
+
+Prerequisite: point DOMAIN's DNS A record (and the AAAA record if you use IPv6) at this
+server's public IP BEFORE running this script, then wait for it to propagate. The installer
+checks this for you and will refuse to request SSL for a domain that does not resolve here yet.
 
 Examples:
   sudo bash scripts/install.sh --domain example.com --app-dir /var/www/example.com
   sudo bash scripts/install.sh --domain example.com --enable-ssl --email admin@example.com
+  sudo bash scripts/install.sh --domain example.com --enable-ssl --email admin@example.com --include-www
+  sudo bash scripts/install.sh --domain example.com --php-version 8.4 --allow-php-ppa
 USAGE
 }
 
@@ -81,6 +105,16 @@ parse_args() {
         INSTALL_MYSQL="true"; shift ;;
       --install-redis)
         INSTALL_REDIS="true"; shift ;;
+      --include-www)
+        INCLUDE_WWW="true"; shift ;;
+      --node-version)
+        NODE_MAJOR="${2:-}"; shift 2 ;;
+      --skip-node)
+        INSTALL_NODE="false"; shift ;;
+      --allow-php-ppa)
+        ALLOW_PHP_PPA="true"; shift ;;
+      --skip-dns-check)
+        SKIP_DNS_CHECK="true"; shift ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -102,7 +136,15 @@ validate_input() {
   if [[ -n "${EMAIL}" ]]; then
     [[ "${EMAIL}" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "Invalid email: ${EMAIL}"
   fi
+  if [[ "${INSTALL_NODE}" == "true" ]]; then
+    [[ "${NODE_MAJOR}" =~ ^[0-9]+$ ]] || die "--node-version must be a Node.js major version number, e.g. 20 or 22."
+  fi
   SITE_ID="$(printf '%s' "${DOMAIN}" | sed 's/[^A-Za-z0-9._-]/_/g')"
+
+  SERVER_NAMES="${DOMAIN}"
+  if [[ "${INCLUDE_WWW}" == "true" ]]; then
+    SERVER_NAMES="${DOMAIN} www.${DOMAIN}"
+  fi
 }
 
 check_os() {
@@ -118,15 +160,116 @@ apt_update_once() {
   apt-get update -y
 }
 
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 || apt-get install -y curl ca-certificates
+}
+
+resolve_domain_ip() {
+  local host="$1"
+  getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | head -n1
+}
+
+detect_public_ip() {
+  local ip url
+  for url in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+    ip="$(curl -fsSL --max-time 5 "${url}" 2>/dev/null | tr -d '[:space:]')" || true
+    if [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s' "${ip}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+check_dns_propagation() {
+  if [[ "${SKIP_DNS_CHECK}" == "true" ]]; then
+    warn "Skipping DNS propagation check (--skip-dns-check). SSL requests will fail if DNS is not actually live."
+    DNS_CHECK_PASSED="skipped"
+    return
+  fi
+
+  log "Checking that ${DOMAIN} resolves to this server before touching Nginx/SSL"
+  ensure_curl
+
+  local public_ip resolved_ip
+  public_ip="$(detect_public_ip || true)"
+  if [[ -z "${public_ip}" ]]; then
+    warn "Could not determine this server's public IP (outbound HTTPS to IP-lookup services may be blocked). Skipping automated DNS check."
+    DNS_CHECK_PASSED="unknown"
+    return
+  fi
+
+  resolved_ip="$(resolve_domain_ip "${DOMAIN}")" || true
+
+  if [[ -z "${resolved_ip}" ]]; then
+    DNS_CHECK_PASSED="false"
+    warn "${DOMAIN} does not resolve yet (no A record found from this server)."
+    if [[ "${ENABLE_SSL}" == "true" ]]; then
+      die "Refusing to request SSL for ${DOMAIN}: DNS has not propagated. Point the A record to ${public_ip}, wait for it to propagate (check with: dig +short ${DOMAIN}), then re-run. Use --skip-dns-check to override at your own risk."
+    fi
+    warn "Continuing without SSL. Nginx/PHP will still be set up, but the site will not be reachable by domain until DNS propagates."
+    return
+  fi
+
+  if [[ "${resolved_ip}" != "${public_ip}" ]]; then
+    DNS_CHECK_PASSED="false"
+    warn "${DOMAIN} currently resolves to ${resolved_ip}, but this server's public IP is ${public_ip}."
+    if [[ "${ENABLE_SSL}" == "true" ]]; then
+      die "Refusing to request SSL for ${DOMAIN}: DNS points somewhere else. Fix the A record, wait for propagation, then re-run. Use --skip-dns-check to override at your own risk."
+    fi
+    warn "Continuing without SSL. Fix the A record before enabling SSL."
+    return
+  fi
+
+  if [[ "${INCLUDE_WWW}" == "true" ]]; then
+    local www_resolved_ip
+    www_resolved_ip="$(resolve_domain_ip "www.${DOMAIN}")" || true
+    if [[ -z "${www_resolved_ip}" || "${www_resolved_ip}" != "${public_ip}" ]]; then
+      if [[ "${ENABLE_SSL}" == "true" ]]; then
+        die "Refusing to request SSL for www.${DOMAIN}: it does not resolve to ${public_ip} yet. Add/fix the www A record, wait for propagation, then re-run (or drop --include-www)."
+      fi
+      warn "www.${DOMAIN} does not resolve to ${public_ip} yet. Nginx will still accept it, but add/fix its A record before requesting SSL for it."
+    fi
+  fi
+
+  DNS_CHECK_PASSED="true"
+  log "${DOMAIN} correctly resolves to this server (${public_ip})."
+}
+
+warn_if_hsts_preload_tld() {
+  local tld="${DOMAIN##*.}"
+  case "${tld}" in
+    app|dev|page|new|foo|gle|prod)
+      if [[ "${ENABLE_SSL}" != "true" ]]; then
+        warn ".${tld} domains are on browsers' built-in HSTS preload list: browsers refuse plain HTTP and will show a connection error until HTTPS is live. Re-run with --enable-ssl --email you@example.com once DNS has propagated, or your site will look 'down' over HTTP even though Nginx is fine."
+      fi
+      ;;
+  esac
+}
+
 package_available() {
   local package="$1"
   apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}' | grep -vq '(none)'
 }
 
+add_php_ppa() {
+  log "PHP 8.4 is not in your default APT repositories. Adding the trusted ondrej/php PPA (--allow-php-ppa)"
+  apt-get install -y software-properties-common gnupg ca-certificates
+  add-apt-repository -y ppa:ondrej/php
+  apt-get update -y
+}
+
 select_php_version() {
   if [[ "${PHP_VERSION}" != "auto" ]]; then
     [[ "${PHP_VERSION}" =~ ^8\.[3-9]$ ]] || die "PHP version must be 8.3 or newer, e.g. 8.3 or 8.4."
-    package_available "php${PHP_VERSION}-fpm" || die "php${PHP_VERSION}-fpm is not available from your current APT repositories. Use Ubuntu 24.04+ or provide a supported PHP version."
+    if ! package_available "php${PHP_VERSION}-fpm"; then
+      if [[ "${PHP_VERSION}" == "8.4" && "${ALLOW_PHP_PPA}" == "true" ]]; then
+        add_php_ppa
+        package_available "php${PHP_VERSION}-fpm" || die "php${PHP_VERSION}-fpm is still unavailable even after adding ondrej/php. Check the PPA is reachable from this server."
+      else
+        die "php${PHP_VERSION}-fpm is not available from your current APT repositories. Re-run with --allow-php-ppa to add the trusted ondrej/php PPA and get PHP 8.4, or use Ubuntu 24.10+/a supported PHP version."
+      fi
+    fi
     return
   fi
 
@@ -142,7 +285,16 @@ select_php_version() {
     fi
   done
 
-  die "No APT-managed PHP >= 8.3 package was found. Use Ubuntu 24.04+ or add a trusted PHP repository manually before running."
+  if [[ "${ALLOW_PHP_PPA}" == "true" ]]; then
+    add_php_ppa
+    if package_available "php8.4-fpm"; then
+      PHP_VERSION="8.4"
+      log "Selected PHP 8.4 from ondrej/php after adding the PPA"
+      return
+    fi
+  fi
+
+  die "No APT-managed PHP >= 8.3 package was found. Use Ubuntu 24.04+, or re-run with --allow-php-ppa to add the trusted ondrej/php PPA."
 }
 
 install_base_packages() {
@@ -226,6 +378,36 @@ install_composer() {
   composer --version --no-ansi
 }
 
+install_nodejs() {
+  if [[ "${INSTALL_NODE}" != "true" ]]; then
+    warn "Skipping Node.js installation (--skip-node). React/Vue/Vite asset builds will need Node installed manually."
+    return
+  fi
+
+  if command -v node >/dev/null 2>&1; then
+    local installed_major
+    installed_major="$(node -v | sed -E 's/^v([0-9]+).*/\1/')"
+    if [[ "${installed_major}" == "${NODE_MAJOR}" ]]; then
+      log "Node.js ${NODE_MAJOR}.x is already installed: $(node -v)"
+      return
+    fi
+    warn "Node.js $(node -v) is already installed (major v${installed_major}), not the requested ${NODE_MAJOR}.x. Leaving it as-is to avoid breaking an existing setup. Pass --node-version ${installed_major} to match it, or upgrade manually if you need ${NODE_MAJOR}.x."
+    return
+  fi
+
+  log "Installing Node.js ${NODE_MAJOR}.x and npm from the official NodeSource APT repository"
+  apt-get install -y ca-certificates curl gnupg
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  chmod 0644 /etc/apt/keyrings/nodesource.gpg
+  printf 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_%s.x nodistro main\n' "${NODE_MAJOR}" \
+    > /etc/apt/sources.list.d/nodesource.list
+  apt-get update -y
+  apt-get install -y nodejs
+
+  log "Installed Node.js $(node -v), npm $(npm -v)"
+}
+
 configure_php() {
   log "Applying PHP-FPM security and production settings"
   local ini_content
@@ -281,7 +463,7 @@ NGINXSECURITY
 server {
     listen 80;
     listen [::]:80;
-    server_name ${DOMAIN};
+    server_name ${SERVER_NAMES};
 
     root ${APP_DIR}/public;
     index index.php index.html;
@@ -394,8 +576,12 @@ SYSCTL
 
 write_supervisor_template() {
   log "Writing disabled Supervisor template for Laravel queue workers"
-  cat > /etc/supervisor/conf.d/laravel-worker.conf.example <<SUPERVISOR
-[program:laravel-worker]
+  # Named after SITE_ID (derived from --domain), not a fixed "laravel-worker"
+  # name: on a droplet running install.sh for more than one domain, a fixed
+  # name would make each re-run overwrite the previous domain's template/
+  # program name instead of adding its own.
+  cat > "/etc/supervisor/conf.d/laravel-worker-${SITE_ID}.conf.example" <<SUPERVISOR
+[program:laravel-worker-${SITE_ID}]
 process_name=%(program_name)s_%(process_num)02d
 command=php ${APP_DIR}/artisan queue:work --sleep=3 --tries=3 --max-time=3600
 autostart=true
@@ -425,8 +611,22 @@ install_ssl_certificate() {
   snap install --classic certbot
   ln -sfn /snap/bin/certbot /usr/bin/certbot
 
+  local certbot_domain_args=(-d "${DOMAIN}")
+  if [[ "${INCLUDE_WWW}" == "true" ]]; then
+    certbot_domain_args+=(-d "www.${DOMAIN}")
+  fi
+
+  # Note for multi-domain droplets: if you already ran this script for another
+  # site on the same server, do NOT create this site's Nginx vhost by copying
+  # a previous SSL-enabled vhost file. Certbot writes "listen [::]:443 ssl
+  # ipv6only=on;" into each vhost, and ipv6only=on may only appear once across
+  # the whole server - copying an existing vhost duplicates it and nginx -t
+  # fails with "duplicate listen options". Let this script and Certbot
+  # generate each site's config independently instead.
   certbot --nginx \
-    -d "${DOMAIN}" \
+    "${certbot_domain_args[@]}" \
+    --cert-name "${DOMAIN}" \
+    --expand \
     --agree-tos \
     --email "${EMAIL}" \
     --redirect \
@@ -447,9 +647,12 @@ Domain:      ${DOMAIN}
 App path:    ${APP_DIR}
 Web root:    ${APP_DIR}/public
 PHP-FPM:     PHP ${PHP_VERSION}
+Node.js:     ${INSTALL_NODE} $([[ "${INSTALL_NODE}" == "true" ]] && command -v node >/dev/null 2>&1 && node -v || true)
 Nginx site:  /etc/nginx/sites-available/${SITE_ID}.conf
+Worker tmpl: /etc/supervisor/conf.d/laravel-worker-${SITE_ID}.conf.example
 Firewall:    UFW enabled; inbound default deny; allowed ${SSH_PORT}/tcp, 80/tcp, 443/tcp
 SSL:         ${ENABLE_SSL}
+DNS check:   ${DNS_CHECK_PASSED}
 MySQL:       ${INSTALL_MYSQL}
 Redis:       ${INSTALL_REDIS}
 
@@ -464,6 +667,13 @@ Next deployment steps:
      sudo systemctl restart php${PHP_VERSION}-fpm
 
 Use scripts/verify.sh to review service status and exposed ports.
+
+Adding another domain or subdomain on this same server later? Re-run this
+script again with a different --domain and --app-dir (e.g. a subdomain like
+--domain app.${DOMAIN} --app-dir /var/www/app.${DOMAIN}). Each run only
+touches its own app directory, Nginx site, and certificate; server-wide
+pieces (firewall, PHP-FPM, Node.js, MySQL/Redis) are safely re-applied, not
+duplicated. See README: "Multiple domains and subdomains on one droplet".
 SUMMARY
 
   if [[ "${AUTO_FELL_BACK_TO_83}" == "true" ]]; then
@@ -473,9 +683,21 @@ Compatibility note:
   - Auto mode selected PHP 8.3 because PHP 8.4 was not available from current APT repositories.
   - Some Laravel 13 lockfiles resolve Symfony 8 packages that require PHP >= 8.4.
   - If 'composer install' fails with 'symfony/* requires php >=8.4', re-run this installer with:
-      --php-version 8.4
-    and use an Ubuntu/repository source that provides php8.4 packages.
+      --php-version 8.4 --allow-php-ppa
+    to add the trusted ondrej/php PPA and get PHP 8.4.
 NOTE
+  fi
+
+  if [[ "${DNS_CHECK_PASSED}" == "false" ]]; then
+    cat <<DNSNOTE
+
+DNS note:
+  - ${DOMAIN} did not resolve to this server's public IP during setup.
+  - Nginx/PHP are configured, but the site will not be reachable by domain
+    (and SSL cannot be issued) until DNS propagates.
+  - Check with: dig +short ${DOMAIN}
+  - Once it matches this server's IP, re-run with --enable-ssl --email you@example.com.
+DNSNOTE
   fi
 }
 
@@ -483,13 +705,16 @@ main() {
   require_root
   parse_args "$@"
   validate_input
+  warn_if_hsts_preload_tld
   check_os
   apt_update_once
+  check_dns_propagation
   select_php_version
   install_base_packages
   install_php_packages
   install_optional_datastores
   install_composer
+  install_nodejs
   configure_php
   configure_app_directory
   configure_nginx
